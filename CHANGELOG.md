@@ -10,6 +10,11 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-05
+
+### Added
+- Claude Code の hooks(`SessionStart` / `SessionEnd`)に登録する `--hook-start` / `--hook-end` を追加。セッションの開始と同時に裏で記録を始め、終了で止まる。フックが呼ばれずに Claude Code が終わったときも自分で終わる。
+
 ## [1.1.0] - 2026-11-05
 
 ### Added

@@ -74,6 +74,43 @@ export CLAUDE_TAIL_LOG_DIR="$HOME/Documents/claudecode-logs"
 - `-n` のときは前回までの記録を消さないよう、既存のファイルに追記する。
 - `-o` を指定したときはそちらだけに書き出す。その回だけ書き出したくないときは `--no-save`。
 
+### セッションの開始と同時に自動で記録する
+
+Claude Code の [hooks](https://code.claude.com/docs/en/hooks) に登録すると、claude-tail を手で起動しなくても、
+セッションが始まると裏で記録を始め、終わると止まる。`~/.claude/settings.json` に次を足す。
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CLAUDE_TAIL_LOG_DIR=\"$HOME/Documents/claudecode-logs\" claude-tail --hook-start"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "claude-tail --hook-end", "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- 書き出し先は `CLAUDE_TAIL_LOG_DIR`(必須)。ファイル名は上と同じ。ツールの出力も残すなら `--hook-start -t`。
+- フックから渡されるトランスクリプトのパスを直接追いかけるので、同じディレクトリで複数のセッションを開いていても取り違えない。
+- `/clear` で切り替えると、それぞれのセッションが別のファイルになる。resume や compact では同じファイルの記録を続ける。
+- 終わるときは、ファイルの末尾まで読み切ってから止まる(終了直前の応答も残る)。
+- ターミナルごと閉じるなどで `SessionEnd` が呼ばれなかったときも、Claude Code のプロセスがいなくなれば自分で終わる。
+- 裏のプロセスの pid とエラーは `~/.local/state/claude-tail/`(`XDG_STATE_HOME` があればその下)に置く。
+- フックの設定を変えたら、Claude Code のセッションを開き直すと確実に反映される。
+
 ### 出力の形
 
 ~~~

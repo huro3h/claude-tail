@@ -114,6 +114,30 @@ Claude Code の会話を、別ターミナルで `tail -f` のように追いか
 - `-o` が優先、`--no-save` で無効。`-n` のときだけ追記(上書きすると前回までの記録が消える)。
 - テストは `CLAUDE_TAIL_LOG_DIR => nil` で起動する。作者のシェルでは設定済みなので、消さないとテストのたびに書き出される。
 
+### フックからの自動記録(`--hook-start` / `--hook-end`)
+
+設定例は README。作者の環境では dotfiles の `claude/home/settings.json` に入れてある。
+
+- フックの仕様(公式 https://code.claude.com/docs/en/hooks で確かめた。2026-11-05):
+  - 標準入力の JSON に `session_id` `transcript_path` `cwd`、SessionStart は `source`(startup/resume/clear/compact/fork)、
+    SessionEnd は `reason`。
+  - **SessionStart の標準出力は Claude への文脈として足される。** なので `--hook-start` は標準出力に何も出さず、
+    裏のプロセスの出力も `File::NULL` に捨てる(ファイルへの書き出しは `CLAUDE_TAIL_LOG_DIR` 経由)。エラーは `hook.log`。
+  - 裏で起動したプロセスの出力をつないだままにすると、Claude Code がフックの出力を読み終われない。
+  - **SessionEnd は全フック合わせて既定1.5秒。** `--hook-end` は TERM を送って pid ファイルを消すだけで待たない。
+    Ruby の起動が遅い環境向けに、設定例では `timeout: 5` を付けて予算を広げている。
+- `--hook-start` は `Process.spawn(..., pgroup: true)` + `Process.detach` で裏に `--wait --watch-pid <Claude の pid> <transcript>` を起動し、
+  pid を `<state_dir>/<session_id>.pid` に書いてすぐ戻る。`state_dir` は `XDG_STATE_HOME` か `~/.local/state` の下の `claude-tail`。
+- **トランスクリプトは SessionStart の時点ではまだ無いことがある**(最初の発言で作られる)ので、`--wait` で現れるまで待つ。
+- resume / compact でも SessionStart は呼ばれる。pid ファイルのプロセスが生きていれば2つ目を起動しない。
+  pid の使い回しで別プロセスを止めないよう、`ps -o command=` に `claude-tail` が含まれるかまで確かめる(`follower_pid`)。
+- **TERM ではすぐ終わらない。** フラグを立てるだけにして、`tail` のループが末尾まで読み切った(EOF)ところで抜ける。
+  すぐ終わると、終了直前に書かれた最後の応答を取りこぼす。INT(手で Ctrl-C)は従来どおり即終了。
+- **SessionEnd が呼ばれない終わり方**(ターミナルごと閉じる・落ちる)でプロセスが残り続けないよう、Claude Code 本体の pid を
+  見張り、いなくなったら同じく読み切って終わる。フックのコマンドは `sh -c` 経由で起動されるので、`claude_pid` は
+  親をたどってシェル(sh/bash/zsh/dash/fish)を飛ばす。作者の環境では `claude` という名前のプロセスに行き着くことを確かめた。
+- テスト(`test_hooks` ほか)は `XDG_STATE_HOME` を一時ディレクトリに向ける。見張る pid はテストのプロセス自身になる。
+
 ### 整形(`format`)
 
 順序:

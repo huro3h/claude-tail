@@ -10,6 +10,7 @@
 require 'fileutils'
 require 'json'
 require 'optparse'
+require 'rbconfig'
 require 'time'
 
 # cron や launchd から起動されると LANG が無く、Ruby の既定エンコーディングが US-ASCII になって
@@ -257,11 +258,109 @@ module ClaudeTail
           end
           next
         end
-        break unless follow
+        # 止める合図は末尾まで読み切ってから見る。セッションの終了直前に書かれた発言を取りこぼさないため。
+        break if !follow || stop_requested?
 
         sleep POLL_INTERVAL
       end
     end
+  end
+
+  # TERM を受けた(フックの SessionEnd から止められた)か、見張っている Claude Code のプロセスがいなくなった。
+  def stop_requested?
+    @stop || (@watch_pid && !alive?(@watch_pid))
+  end
+
+  def request_stop
+    @stop = true
+  end
+
+  def alive?(pid)
+    Process.kill(0, pid)
+    true
+  rescue Errno::ESRCH
+    false
+  rescue Errno::EPERM
+    true
+  end
+
+  # ---- Claude Code の hooks から使う(--hook-start / --hook-end) ----
+  # SessionStart で裏に追いかけるプロセスを起動し、SessionEnd で止める。
+  # どのプロセスがどのセッションのものかは、状態ディレクトリの <セッションID>.pid に置く。
+
+  def state_dir
+    base = ENV['XDG_STATE_HOME']
+    File.join(base && !base.empty? ? base : File.join(Dir.home, '.local', 'state'), 'claude-tail')
+  end
+
+  # フックには標準入力で JSON が渡る(session_id, transcript_path, cwd, source / reason など)。
+  def read_hook_input
+    input = parse($stdin.read.to_s)
+    raise TailError, 'フックの入力(標準入力の JSON)が読めません' unless input
+
+    id = input['session_id'].to_s.gsub(/[^A-Za-z0-9-]/, '')
+    raise TailError, 'フックの入力に session_id がありません' if id.empty?
+
+    [input, File.join(state_dir, "#{id}.pid")]
+  end
+
+  # pid が使い回されて別のプロセスを指している場合に止めないよう、claude-tail のプロセスかまで確かめる。
+  def follower_pid(pid_file)
+    pid = File.read(pid_file).to_i
+    return nil unless pid.positive? && alive?(pid)
+
+    command = IO.popen(['ps', '-o', 'command=', '-p', pid.to_s], err: File::NULL, &:read).to_s
+    command.include?('claude-tail') ? pid : nil
+  rescue Errno::ENOENT
+    nil
+  end
+
+  # フックのコマンドはシェル経由で起動されることがあるので、シェルを飛ばして Claude Code 本体の pid まで遡る。
+  # セッションの終了でフックが呼ばれずに Claude Code が落ちた(ターミナルごと閉じたなど)ときに、
+  # 追いかけるプロセスが残り続けないよう、この pid を見張らせる。
+  def claude_pid
+    pid = Process.ppid
+    5.times do
+      ppid, comm = IO.popen(['ps', '-o', 'ppid=,comm=', '-p', pid.to_s], err: File::NULL, &:read).to_s.strip.split(/\s+/, 2)
+      break unless comm && %w[sh bash zsh dash fish].include?(File.basename(comm).delete_prefix('-'))
+
+      pid = ppid.to_i
+    end
+    pid
+  end
+
+  def hook_start(tools:)
+    input, pid_file = read_hook_input
+    transcript = input['transcript_path'].to_s
+    raise TailError, 'フックの入力に transcript_path がありません' if transcript.empty?
+
+    log_dir = ENV['CLAUDE_TAIL_LOG_DIR']
+    raise TailError, '--hook-start には書き出し先の CLAUDE_TAIL_LOG_DIR が要ります' if log_dir.nil? || log_dir.empty?
+
+    # resume や compact でも SessionStart は呼ばれる。同じセッションを追いかけているなら何もしない。
+    return if File.exist?(pid_file) && follower_pid(pid_file)
+
+    FileUtils.mkdir_p(state_dir)
+    # 書き出しはするが、フックの標準出力は Claude への文脈になるので、追いかけるプロセスの出力は捨てる。
+    # 新しいプロセスグループにして、ターミナルの Ctrl-C が届かないようにする。
+    args = [RbConfig.ruby, File.realpath(__FILE__), '--wait', '--watch-pid', claude_pid.to_s]
+    args << '-t' if tools
+    args << transcript
+    pid = Process.spawn(*args, in: File::NULL, out: File::NULL, err: [File.join(state_dir, 'hook.log'), 'a'], pgroup: true)
+    Process.detach(pid)
+    File.write(pid_file, pid.to_s)
+  end
+
+  def hook_end
+    _input, pid_file = read_hook_input
+    return unless File.exist?(pid_file)
+
+    pid = follower_pid(pid_file)
+    # TERM を受けたプロセスは、末尾まで読み切ってから自分で終わる。
+    Process.kill('TERM', pid) if pid
+    File.delete(pid_file)
+  rescue Errno::ESRCH, Errno::ENOENT
+    nil
   end
 
   def run(argv)
@@ -278,6 +377,11 @@ module ClaudeTail
       o.on('--no-follow', '今ある分を出して終了する') { opts[:follow] = false }
       o.on('-l', '--list', 'セッション一覧(更新が新しい順、タイトル付き)') { opts[:list] = true }
       o.on('-C', '--directory DIR', 'DIR で開いたセッションを対象にする') { |v| opts[:cwd] = v }
+      o.on('--hook-start', 'Claude Code の SessionStart フック用。裏で記録を始める(-t も付けられる)') { opts[:hook] = :start }
+      o.on('--hook-end', 'Claude Code の SessionEnd フック用。--hook-start で始めた記録を止める') { opts[:hook] = :end }
+      # 以下2つは --hook-start が裏のプロセスに付けるもの。
+      o.on('--wait', '(内部用)ファイルができるまで待つ') { opts[:wait] = true }
+      o.on('--watch-pid PID', Integer, '(内部用)PID のプロセスがいなくなったら終わる') { |v| @watch_pid = v }
       o.on('-h', '--help', 'このヘルプ') do
         puts o
         exit 0
@@ -286,12 +390,27 @@ module ClaudeTail
     args = parser.parse(argv)
     raise TailError, "引数が多すぎます: #{args.join(' ')}" if args.size > 1
 
+    case opts[:hook]
+    when :start then return hook_start(tools: opts[:tools])
+    when :end then return hook_end
+    end
+
     if opts[:list]
       list(opts[:cwd], $stdout)
       return
     end
 
-    path = resolve(args.first, opts[:cwd])
+    if opts[:wait]
+      # SessionStart の時点ではトランスクリプトがまだ作られていないことがある(最初の発言で作られる)。
+      path = args.first or raise TailError, '--wait にはファイルの指定が要ります'
+      until File.file?(path)
+        return if stop_requested?
+
+        sleep POLL_INTERVAL
+      end
+    else
+      path = resolve(args.first, opts[:cwd])
+    end
     outs = [$stdout]
     file = nil
     log_dir = ENV['CLAUDE_TAIL_LOG_DIR']
@@ -322,6 +441,7 @@ end
 
 if $PROGRAM_NAME == __FILE__
   Signal.trap('INT') { exit 0 }
-  Signal.trap('TERM') { exit 0 }
+  # TERM はすぐには終わらず、ファイルの末尾まで読み切ってから終わる(stop_requested?)。
+  Signal.trap('TERM') { ClaudeTail.request_stop }
   ClaudeTail.run(ARGV)
 end

@@ -24,6 +24,12 @@ class ClaudeTailTest < Minitest::Test
   end
 
   def teardown
+    # --hook-start が裏で起動したプロセスが残っていたら止める。
+    Dir.glob(File.join(@tmp, 'state', 'claude-tail', '*.pid')).each do |f|
+      Process.kill('KILL', File.read(f).to_i)
+    rescue Errno::ESRCH
+      nil
+    end
     FileUtils.rm_rf(@tmp)
   end
 
@@ -251,7 +257,75 @@ class ClaudeTailTest < Minitest::Test
     end
   end
 
+  # SessionStart でトランスクリプトができる前から待ち、SessionEnd の直前に書かれた発言まで書き出して終わる。
+  def test_hooks
+    logs = File.join(@tmp, 'logs')
+    env = hook_env(logs)
+    transcript = File.join(project_dir, 'abcdef12-3456.jsonl')
+    input = JSON.generate('session_id' => 'abcdef12-3456', 'transcript_path' => transcript, 'source' => 'startup')
+
+    out, err, status = Open3.capture3(env, 'ruby', BIN, '--hook-start', stdin_data: input)
+    assert_equal 0, status.exitstatus, err
+    assert_empty out, 'フックの標準出力は Claude への文脈になるので何も出さない'
+    pid_file = File.join(@tmp, 'state', 'claude-tail', 'abcdef12-3456.pid')
+    pid = File.read(pid_file).to_i
+    assert pid.positive?
+
+    # resume や compact で再度呼ばれても、2つ目は起動しない。
+    Open3.capture3(env, 'ruby', BIN, '--hook-start', stdin_data: input)
+    assert_equal pid, File.read(pid_file).to_i
+
+    sleep 0.8
+    File.write(transcript, JSON.generate(user('最初の発言')) + "\n")
+    dest = File.join(logs, '2026-01-01_abcdef12.txt')
+    wait_for { File.exist?(dest) && File.read(dest).include?('最初の発言') }
+
+    File.write(transcript, JSON.generate(user('終了直前の発言', '2026-01-01T00:00:09Z')) + "\n", mode: 'a')
+    _out, err, status = Open3.capture3(env, 'ruby', BIN, '--hook-end', stdin_data: JSON.generate('session_id' => 'abcdef12-3456', 'reason' => 'other'))
+    assert_equal 0, status.exitstatus, err
+    refute File.exist?(pid_file)
+    wait_for { !process_alive?(pid) }
+    assert_includes File.read(dest), '終了直前の発言'
+  end
+
+  # SessionEnd が呼ばれずに Claude Code がいなくなっても、裏のプロセスは自分で終わる。
+  def test_follower_exits_when_watched_process_is_gone
+    path = File.join(@tmp, 'watched.jsonl')
+    File.write(path, JSON.generate(user('x')) + "\n")
+    watched = Process.spawn('sleep', '30')
+    follower = Process.spawn(hook_env(File.join(@tmp, 'logs')), 'ruby', BIN, '--wait', '--watch-pid', watched.to_s, path, out: File::NULL, err: File::NULL)
+    sleep 0.8
+    assert process_alive?(follower)
+    Process.kill('KILL', watched)
+    Process.wait(watched)
+    Timeout.timeout(5) { Process.wait(follower) }
+    assert_equal 0, $?.exitstatus
+  end
+
+  def test_hook_start_without_log_dir
+    input = JSON.generate('session_id' => 'x', 'transcript_path' => File.join(@tmp, 'x.jsonl'))
+    out, err, status = Open3.capture3(@env.merge('XDG_STATE_HOME' => File.join(@tmp, 'state')), 'ruby', BIN, '--hook-start', stdin_data: input)
+    assert_equal 2, status.exitstatus
+    assert_empty out
+    assert_includes err, 'CLAUDE_TAIL_LOG_DIR'
+  end
+
   private
+
+  def hook_env(logs)
+    @env.merge('CLAUDE_TAIL_LOG_DIR' => logs, 'XDG_STATE_HOME' => File.join(@tmp, 'state'))
+  end
+
+  def process_alive?(pid)
+    Process.kill(0, pid)
+    true
+  rescue Errno::ESRCH
+    false
+  end
+
+  def wait_for(timeout: 5)
+    Timeout.timeout(timeout) { sleep 0.1 until yield }
+  end
 
   def read_until(io, needle, timeout: 5)
     buf = +''
