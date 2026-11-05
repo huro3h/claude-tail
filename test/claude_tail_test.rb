@@ -19,7 +19,8 @@ class ClaudeTailTest < Minitest::Test
     @config = File.join(@tmp, 'config')
     @work = File.join(@tmp, 'my.app')
     FileUtils.mkdir_p(@work)
-    @env = { 'CLAUDE_CONFIG_DIR' => @config, 'TZ' => 'UTC' }
+    # 手元のシェルで CLAUDE_TAIL_LOG_DIR を設定していても、テストでは書き出さない。
+    @env = { 'CLAUDE_CONFIG_DIR' => @config, 'TZ' => 'UTC', 'CLAUDE_TAIL_LOG_DIR' => nil }
   end
 
   def teardown
@@ -164,6 +165,37 @@ class ClaudeTailTest < Minitest::Test
     _out, err, status = Open3.capture3(@env, 'ruby', BIN, '--no-follow', chdir: other)
     assert_equal 2, status.exitstatus
     assert_includes err, 'セッションが見つかりません'
+  end
+
+  def test_log_dir
+    path = write_sample('11111111-aaaa')
+    logs = File.join(@tmp, 'logs')
+    env = @env.merge('CLAUDE_TAIL_LOG_DIR' => logs)
+
+    out, err, status = run_cli('--no-follow', env: env)
+    assert_equal 0, status.exitstatus, err
+    dest = File.join(logs, '2026-01-01_新しいタイトル_11111111.txt')
+    assert_includes err, "書き出し先: #{dest}"
+    assert_equal out, File.read(dest)
+
+    # タイトルが変わったら、同じセッションのファイルを新しい名前へ付け替える。
+    File.write(path, JSON.generate({ 'type' => 'ai-title', 'aiTitle' => 'a/b c' }) + "\n", mode: 'a')
+    _out, _err, status = run_cli('--no-follow', env: env)
+    assert_equal 0, status.exitstatus
+    assert_equal ['2026-01-01_a-bc_11111111.txt'], Dir.children(logs)
+
+    # -n は前回までの記録を消さずに追記する。
+    _out, _err, status = run_cli('--no-follow', '-n', env: env)
+    assert_equal 0, status.exitstatus
+    assert_includes File.read(File.join(logs, '2026-01-01_a-bc_11111111.txt')), 'こんにちは'
+
+    # --no-save と -o では既定の書き出し先を使わない。
+    FileUtils.rm_rf(logs)
+    run_cli('--no-follow', '--no-save', env: env)
+    other = File.join(@tmp, 'other.txt')
+    run_cli('--no-follow', '-o', other, env: env)
+    refute File.exist?(logs)
+    assert File.exist?(other)
   end
 
   def test_direct_path_without_project

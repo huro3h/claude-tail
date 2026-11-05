@@ -7,6 +7,7 @@
 #
 # JSONL の形式は Claude Code の内部仕様で、公開ドキュメントはない。ここでの解釈は実物を観察した結果。
 
+require 'fileutils'
 require 'json'
 require 'optparse'
 require 'time'
@@ -77,6 +78,30 @@ module ClaudeTail
   def describe(path)
     t = title(path)
     t ? "#{session_id(path)} 「#{t}」" : session_id(path)
+  end
+
+  # セッションの開始時刻 = timestamp を持つ最初の行。1件も無ければファイルの更新日時。
+  def started_at(path)
+    File.foreach(path, mode: 'rb') do |line|
+      next unless line.include?('"timestamp"')
+
+      record = parse(line)
+      time = record && local_time_of(record['timestamp'])
+      return time if time
+    end
+    File.mtime(path)
+  end
+
+  # CLAUDE_TAIL_LOG_DIR に書き出すファイルのパス。<開始日>_<タイトル>_<IDの先頭8文字>.txt。
+  # タイトルは途中で変わるので、同じセッションの既存ファイルがあれば今のタイトルの名前へ付け替えて使い続ける。
+  def log_path(dir, path)
+    id = session_id(path)[0, 8]
+    name_title = title(path).to_s.gsub(/\s+/, '').gsub(%r{[/\\:*?"<>|[:cntrl:]]}, '-')[0, 50]
+    name = [started_at(path).strftime('%Y-%m-%d'), (name_title unless name_title.empty?), id].compact.join('_')
+    dest = File.join(dir, "#{name}.txt")
+    existing = Dir.children(dir).find { |f| f.end_with?("_#{id}.txt") && f != File.basename(dest) }
+    File.rename(File.join(dir, existing), dest) if existing && !File.exist?(dest)
+    dest
   end
 
   # 引数(セッションID の前方一致 / .jsonl のパス / なし)から追いかけるファイルを決める。
@@ -152,10 +177,14 @@ module ClaudeTail
     "#{label}\n#{fence(body)}"
   end
 
-  def local_time(timestamp)
-    Time.iso8601(timestamp).localtime.strftime('%Y-%m-%d %H:%M:%S')
+  def local_time_of(timestamp)
+    Time.iso8601(timestamp).localtime
   rescue ArgumentError, TypeError
     nil
+  end
+
+  def local_time(timestamp)
+    local_time_of(timestamp)&.strftime('%Y-%m-%d %H:%M:%S')
   end
 
   # 1行(1イベント)を表示用の文字列にする。表示しない行は nil。
@@ -236,13 +265,14 @@ module ClaudeTail
   end
 
   def run(argv)
-    opts = { follow: true, new_only: false, tools: false, output: nil, list: false, cwd: Dir.pwd }
+    opts = { follow: true, new_only: false, tools: false, output: nil, save: true, list: false, cwd: Dir.pwd }
     parser = OptionParser.new do |o|
       o.banner = 'Usage: claude-tail [options] [セッションIDの前方一致 | path/to/session.jsonl]'
       o.separator ''
       o.separator 'Claude Code のセッションの会話を追いかけて表示する。引数なしなら今のディレクトリの最新セッション。'
       o.separator ''
       o.on('-o', '--output FILE', '画面に流しつつファイルにも書き出す(上書き)') { |v| opts[:output] = v }
+      o.on('--no-save', 'CLAUDE_TAIL_LOG_DIR が設定されていても書き出さない') { opts[:save] = false }
       o.on('-n', '--new', '既存分は飛ばし、これからの発言だけを出す') { opts[:new_only] = true }
       o.on('-t', '--tools', 'ツール呼び出しと結果も出す') { opts[:tools] = true }
       o.on('--no-follow', '今ある分を出して終了する') { opts[:follow] = false }
@@ -264,10 +294,18 @@ module ClaudeTail
     path = resolve(args.first, opts[:cwd])
     outs = [$stdout]
     file = nil
+    log_dir = ENV['CLAUDE_TAIL_LOG_DIR']
     if opts[:output]
       file = File.open(opts[:output], 'w')
-      outs << file
+    elsif opts[:save] && log_dir && !log_dir.empty?
+      # 環境変数で決めた既定の書き出し先。-o と違い、-n のときは前回までの記録を消さないよう追記する。
+      dir = File.expand_path(log_dir)
+      FileUtils.mkdir_p(dir)
+      dest = log_path(dir, path)
+      warn "claude-tail: 書き出し先: #{dest}"
+      file = File.open(dest, opts[:new_only] ? 'a' : 'w')
     end
+    outs << file if file
     begin
       tail(path, outs, follow: opts[:follow], new_only: opts[:new_only], tools: opts[:tools])
     ensure
